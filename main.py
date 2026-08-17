@@ -6,32 +6,45 @@ import time
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiohttp import web
+import google.generativeai as genai
 
 # إعداد التسجيل (Logging)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# قراءة التوكن
+# قراءة المتغيرات البيئية من Render
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# مدة خمولك لتفعيل الردود على المحادثات القائمة (30 دقيقة = 1800 ثانية)
+# إعداد نموذج الذكاء الاصطناعي (Google Gemini)
+if GEMINI_API_KEY:
+  genai.configure(api_key=GEMINI_API_KEY)
+  model = genai.GenerativeModel(
+      model_name="gemini-1.5-flash",
+      system_instruction=(
+          "أنت مساعد ذكي ولطيف ترد على الرسائل الخاصة في حساب تيليجرام نيابة"
+          " عن صاحب الحساب. "
+          "صاحب الحساب غير متواجد حالياً. "
+          "مهمتك: الرد على استفسار الشخص باختصار ولطف باللغة العربية، "
+          "وتوضيح أنك رد ذكي مؤقت وأن صاحب الحساب سيتواصل معه شخصياً فور"
+          " تفرغه."
+      ),
+  )
+  logger.info("تم تهيئة نموذج الذكاء الاصطناعي بنجاح.")
+else:
+  model = None
+  logger.warning("لم يتم تعيين GEMINI_API_KEY. سيعمل البوت بالردود الثابتة.")
+
+# مدة خمولك لتفعيل الردود (30 دقيقة = 1800 ثانية)
 OWNER_INACTIVITY_THRESHOLD = 30 * 60
-
-# وقت آخر رسالة أرسلتها أنت
 LAST_OWNER_ACTIVITY = 0
-
-# تتبع المستخدمين الجدد
 KNOWN_USERS = set()
-
-# تتبع حالات المحادثات: {chat_id: {"count": int, "last_msg_time": float, "ack_sent": bool}}
 USER_CONVERSATIONS = {}
 
-# الكلمات المفتاحية للتأكيد والتفهم
 ACK_KEYWORDS = ["تمام", "خوش", "ماشي", "اوكي", "اوك", "ok", "okay"]
 
 
 def is_ack_message(text: str) -> bool:
-  """فحص وجود كلمات الموافقة حتى مع وجود إيموجي أو علامات ترقيم"""
   if not text:
     return False
   cleaned = re.sub(r"[^\w\s]", "", text).strip().lower()
@@ -43,6 +56,18 @@ def is_ack_message(text: str) -> bool:
     if kw in cleaned:
       return True
   return False
+
+
+def generate_ai_reply(user_message: str, fallback_text: str) -> str:
+  """توليد رد ذكي عبر الذكاء الاصطناعي مع نص احتياطي عند الحاجة"""
+  if not model or not user_message:
+    return fallback_text
+  try:
+    response = model.generate_content(user_message)
+    return response.text.strip() if response.text else fallback_text
+  except Exception as e:
+    logger.error(f"خطأ أثناء توليد رد الذكاء الاصطناعي: {e}")
+    return fallback_text
 
 
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
@@ -58,14 +83,14 @@ async def handle_business_message(message: types.Message):
   text = message.text or message.caption or ""
 
   try:
-    # 1. إذا كانت الرسالة صادرة منك أنت (أنت من كتب في المحادثة):
+    # 1. إذا كانت الرسالة صادرة منك أنت:
     if message.chat.type == "private" and message.from_user.id != message.chat.id:
       LAST_OWNER_ACTIVITY = current_time
       KNOWN_USERS.add(chat_id)
       if chat_id in USER_CONVERSATIONS:
         del USER_CONVERSATIONS[chat_id]
       logger.info(
-          f"أنت نشط الآن. تم تحديث وقت النشاط للمحادثة مع: {chat_id}"
+          f"أنت نشط الآن. تم تحديث وقت النشاط للمحادثة: {chat_id}"
       )
       return
 
@@ -80,7 +105,7 @@ async def handle_business_message(message: types.Message):
       if not conv.get("ack_sent", False):
         conv["ack_sent"] = True
         conv["last_msg_time"] = current_time
-        conv["count"] = 3  # لمنع تكرار رسائل العتاب اللاحقة
+        conv["count"] = 3
         KNOWN_USERS.add(chat_id)
         reply_text = "تمام شكرا لانتضارك 🥰🫶"
         await message.reply(reply_text)
@@ -88,12 +113,9 @@ async def handle_business_message(message: types.Message):
         return
       else:
         conv["last_msg_time"] = current_time
-        logger.info(
-            f"تم إرسال رد التأكيد مسبقاً للمستخدم {chat_id}، تم التخطي."
-        )
         return
 
-    # 3. شرط المستخدم الجديد (يرد لمرة واحدة حتى وإن كنت نشطاً):
+    # 3. شرط المستخدم الجديد (رد ذكي لمرة واحدة حتى وإن كنت نشطاً):
     if is_new_user:
       KNOWN_USERS.add(chat_id)
       USER_CONVERSATIONS[chat_id] = {
@@ -101,9 +123,12 @@ async def handle_business_message(message: types.Message):
           "last_msg_time": current_time,
           "ack_sent": False,
       }
-      reply_text = "انتضر ردي انا الان غير متواجد حاليا🥰"
+      fallback = "انتضر ردي انا الان غير متواجد حاليا🥰"
+      reply_text = generate_ai_reply(text, fallback)
       await message.reply(reply_text)
-      logger.info(f"مستخدم جديد {chat_id} - تم إرسال الرد الترحيبي الأول.")
+      logger.info(
+          f"مستخدم جديد {chat_id} - تم إرسال الرد الذكي الترحيبي."
+      )
       return
 
     # 4. للمستخدمين الحاليين: التحقق من خمولك لمدة 30 دقيقة
@@ -113,29 +138,30 @@ async def handle_business_message(message: types.Message):
           (OWNER_INACTIVITY_THRESHOLD - time_since_owner_active) / 60
       )
       logger.info(
-          f"أنت نشط حالياً (متبقي {mins_left} دقيقة لتفعيل الردود التلقائية)."
+          f"أنت نشط حالياً (متبقي {mins_left} دقيقة لتفعيل الردود)."
       )
       return
 
     # 5. منطق الردود المتدرجة عند غيابك لأكثر من 30 دقيقة:
     conv = USER_CONVERSATIONS.get(chat_id)
 
-    # أ) الرسالة الأولى (أو بعد صمت لأكثر من 30 دقيقة):
+    # أ) الرسالة الأولى (رد ذكي عبر AI):
     if not conv or (current_time - conv["last_msg_time"]) > 30 * 60:
       USER_CONVERSATIONS[chat_id] = {
           "count": 1,
           "last_msg_time": current_time,
           "ack_sent": False,
       }
-      reply_text = "انتضر ردي انا الان غير متواجد حاليا🥰"
+      fallback = "انتضر ردي انا الان غير متواجد حاليا🥰"
+      reply_text = generate_ai_reply(text, fallback)
       await message.reply(reply_text)
-      logger.info(f"تم إرسال الرد 1 للمستخدم: {chat_id}")
+      logger.info(f"تم إرسال الرد الذكي 1 للمستخدم: {chat_id}")
       return
 
     diff = current_time - conv["last_msg_time"]
     count = conv["count"]
 
-    # ب) الرسالة الثانية (في أقل من دقيقتين = 120 ثانية):
+    # ب) الرسالة الثانية (في أقل من دقيقتين):
     if count == 1:
       if diff <= 120:
         conv["count"] = 2
@@ -147,7 +173,7 @@ async def handle_business_message(message: types.Message):
         conv["last_msg_time"] = current_time
       return
 
-    # ج) الرسالة الثالثة (في أقل من 3 دقائق = 180 ثانية):
+    # ج) الرسالة الثالثة (في أقل من 3 دقائق):
     elif count == 2:
       if diff <= 180:
         conv["count"] = 3
@@ -162,9 +188,6 @@ async def handle_business_message(message: types.Message):
     # د) أكثر من 3 رسائل:
     else:
       conv["last_msg_time"] = current_time
-      logger.info(
-          f"المستخدم {chat_id} تجاوز 3 رسائل متتالية، تم تخطي الرد."
-      )
       return
 
   except Exception as e:
@@ -174,13 +197,16 @@ async def handle_business_message(message: types.Message):
 # أمر /start
 @dp.message(CommandStart())
 async def handle_start(message: types.Message):
-  await message.answer("أهلاً بك! البوت مبرمج بالقواعد الذكية للردود التلقائية.")
+  await message.answer(
+      "أهلاً بك! البوت مبرمج بالذكاء الاصطناعي للردود التلقائية الذكية عبر"
+      " Telegram Business."
+  )
 
 
 # خادم ويب لإبقاء Render نشطاً
 async def health_check(request):
   return web.Response(
-      text="Telegram Business Bot is running with all custom rules!", status=200
+      text="Telegram Business AI Bot is running!", status=200
   )
 
 
@@ -207,7 +233,7 @@ async def main():
 
   await start_web_server()
   await bot.delete_webhook(drop_pending_updates=True)
-  logger.info("بدء الاستماع للرسائل بالقواعد الجديدة الكاملة...")
+  logger.info("بدء الاستماع للرسائل بالذكاء الاصطناعي...")
   await dp.start_polling(bot)
 
 
