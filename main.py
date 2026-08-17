@@ -5,37 +5,24 @@ import re
 import time
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
+import aiohttp
 from aiohttp import web
-import google.generativeai as genai
 
 # إعداد التسجيل (Logging)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# قراءة المتغيرات البيئية من Render
+# قراءة التوكنات من المتغيرات البيئية في Render
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+AI_API_KEY = os.getenv("AI_API_KEY") or os.getenv("GEMINI_API_KEY")
 
-# إعداد نموذج الذكاء الاصطناعي (Google Gemini)
-if GEMINI_API_KEY:
-  genai.configure(api_key=GEMINI_API_KEY)
-  model = genai.GenerativeModel(
-      model_name="gemini-1.5-flash",
-      system_instruction=(
-          "أنت مساعد ذكي ولطيف ترد على الرسائل الخاصة في حساب تيليجرام نيابة"
-          " عن صاحب الحساب. "
-          "صاحب الحساب غير متواجد حالياً. "
-          "مهمتك: الرد على استفسار الشخص باختصار ولطف باللغة العربية، "
-          "وتوضيح أنك رد ذكي مؤقت وأن صاحب الحساب سيتواصل معه شخصياً فور"
-          " تفرغه."
-      ),
-  )
-  logger.info("تم تهيئة نموذج الذكاء الاصطناعي بنجاح.")
-else:
-  model = None
-  logger.warning("لم يتم تعيين GEMINI_API_KEY. سيعمل البوت بالردود الثابتة.")
+# إعدادات مزود الذكاء الاصطناعي (Bluesminds)
+AI_BASE_URL = os.getenv(
+    "AI_BASE_URL", "https://api.bluesminds.com/v1/chat/completions"
+)
+AI_MODEL_NAME = os.getenv("AI_MODEL", "gpt-4o-mini")
 
-# مدة خمولك لتفعيل الردود (30 دقيقة = 1800 ثانية)
+# مدة خمولك لتفعيل الردود على المحادثات القائمة (30 دقيقة = 1800 ثانية)
 OWNER_INACTIVITY_THRESHOLD = 30 * 60
 LAST_OWNER_ACTIVITY = 0
 KNOWN_USERS = set()
@@ -58,16 +45,58 @@ def is_ack_message(text: str) -> bool:
   return False
 
 
-def generate_ai_reply(user_message: str, fallback_text: str) -> str:
-  """توليد رد ذكي عبر الذكاء الاصطناعي مع نص احتياطي عند الحاجة"""
-  if not model or not user_message:
+async def generate_ai_reply(user_message: str, fallback_text: str) -> str:
+  """توليد الرد الذكي عبر Bluesminds API"""
+  if not AI_API_KEY or not user_message:
     return fallback_text
+
+  headers = {
+      "Authorization": f"Bearer {AI_API_KEY}",
+      "Content-Type": "application/json",
+  }
+
+  payload = {
+      "model": AI_MODEL_NAME,
+      "messages": [
+          {
+              "role": "system",
+              "content": (
+                  "أنت سكرتير ومساعد ذكي ترد على الرسائل الخاصة في حساب"
+                  " تيليجرام نيابة عن صاحب الحساب. صاحب الحساب غير متواجد"
+                  " حالياً. مهمتك: الرد على استفسار الشخص باختصار ولطف باللغة"
+                  " العربية، وتوضيح أنك رد ذكي مؤقت وأن صاحب الحساب سيتواصل"
+                  " معه شخصياً فور تفرغه."
+              ),
+          },
+          {"role": "user", "content": user_message},
+      ],
+      "max_tokens": 150,
+  }
+
   try:
-    response = model.generate_content(user_message)
-    return response.text.strip() if response.text else fallback_text
+    async with aiohttp.ClientSession() as session:
+      async with session.post(
+          AI_BASE_URL, headers=headers, json=payload, timeout=10
+      ) as resp:
+        if resp.status == 200:
+          data = await resp.json()
+          ai_text = (
+              data.get("choices", [{}])[0]
+              .get("message", {})
+              .get("content", "")
+              .strip()
+          )
+          if ai_text:
+            return ai_text
+        else:
+          err_text = await resp.text()
+          logger.error(
+              f"خطأ من سيرفر الذكاء الاصطناعي ({resp.status}): {err_text}"
+          )
   except Exception as e:
-    logger.error(f"خطأ أثناء توليد رد الذكاء الاصطناعي: {e}")
-    return fallback_text
+    logger.error(f"استثناء أثناء طلب الذكاء الاصطناعي: {e}")
+
+  return fallback_text
 
 
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
@@ -115,7 +144,7 @@ async def handle_business_message(message: types.Message):
         conv["last_msg_time"] = current_time
         return
 
-    # 3. شرط المستخدم الجديد (رد ذكي لمرة واحدة حتى وإن كنت نشطاً):
+    # 3. شرط المستخدم الجديد (يرد ذكياً لمرة واحدة حتى وإن كنت نشطاً):
     if is_new_user:
       KNOWN_USERS.add(chat_id)
       USER_CONVERSATIONS[chat_id] = {
@@ -124,7 +153,7 @@ async def handle_business_message(message: types.Message):
           "ack_sent": False,
       }
       fallback = "انتضر ردي انا الان غير متواجد حاليا🥰"
-      reply_text = generate_ai_reply(text, fallback)
+      reply_text = await generate_ai_reply(text, fallback)
       await message.reply(reply_text)
       logger.info(
           f"مستخدم جديد {chat_id} - تم إرسال الرد الذكي الترحيبي."
@@ -153,7 +182,7 @@ async def handle_business_message(message: types.Message):
           "ack_sent": False,
       }
       fallback = "انتضر ردي انا الان غير متواجد حاليا🥰"
-      reply_text = generate_ai_reply(text, fallback)
+      reply_text = await generate_ai_reply(text, fallback)
       await message.reply(reply_text)
       logger.info(f"تم إرسال الرد الذكي 1 للمستخدم: {chat_id}")
       return
@@ -206,7 +235,7 @@ async def handle_start(message: types.Message):
 # خادم ويب لإبقاء Render نشطاً
 async def health_check(request):
   return web.Response(
-      text="Telegram Business AI Bot is running!", status=200
+      text="Telegram Business AI Bot is running with Bluesminds AI!", status=200
   )
 
 
@@ -233,7 +262,7 @@ async def main():
 
   await start_web_server()
   await bot.delete_webhook(drop_pending_updates=True)
-  logger.info("بدء الاستماع للرسائل بالذكاء الاصطناعي...")
+  logger.info("بدء الاستماع للرسائل بالذكاء الاصطناعي من Bluesminds...")
   await dp.start_polling(bot)
 
 
