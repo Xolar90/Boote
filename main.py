@@ -6,17 +6,21 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiohttp import web
 
-# إعداد التسجيل لمتابعة العمليات
+# إعداد التسجيل
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# قراءة التوكن من المتغيرات البيئية
+# قراءة التوكن
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# مدة الانتظار بين الردود لنفس الشخص (بالثواني) - 1800 ثانية = 30 دقيقة
-COOLDOWN_SECONDS = 1800
-# لتسجيل وقت آخر رد لكل محادثة
-LAST_REPLIED = {}
+# مدة خمولك لتفعيل البوت (30 دقيقة = 1800 ثانية)
+OWNER_INACTIVITY_THRESHOLD = 30 * 60
+
+# وقت آخر رسالة أرسلتها أنت (يبدأ من 0 ليعمل مباشرة في حال عدم نشاطك)
+LAST_OWNER_ACTIVITY = 0
+
+# تتبع المحادثات: {chat_id: {"count": int, "last_msg_time": float}}
+USER_CONVERSATIONS = {}
 
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
@@ -25,32 +29,84 @@ dp = Dispatcher()
 # معالجة رسائل Telegram Business
 @dp.business_message()
 async def handle_business_message(message: types.Message):
+  global LAST_OWNER_ACTIVITY
+  current_time = time.time()
+  chat_id = message.chat.id
+
   try:
-    # 1. منع البوت من الرد على رسائلك أنت (الرسائل الصادرة من حسابك)
+    # 1. إذا كانت الرسالة صادرة منك أنت (أنت من يكتب في المحادثة):
     if message.chat.type == "private" and message.from_user.id != message.chat.id:
-      logger.info("تجاهل رسالة صادرة من صاحب الحساب.")
+      LAST_OWNER_ACTIVITY = current_time
+      # تصفير المحادثة مع هذا الشخص لأنك قمت بالرد عليه بنفسك
+      if chat_id in USER_CONVERSATIONS:
+        del USER_CONVERSATIONS[chat_id]
+      logger.info(
+          f"أنت نشط الآن. تم تحديث وقت النشاط وتصفير المحادثة لـ: {chat_id}"
+      )
       return
 
-    chat_id = message.chat.id
-    current_time = time.time()
+    # 2. التحقق من خمولك لمدة 30 دقيقة
+    time_since_owner_active = current_time - LAST_OWNER_ACTIVITY
+    if time_since_owner_active < OWNER_INACTIVITY_THRESHOLD:
+      mins_left = int(
+          (OWNER_INACTIVITY_THRESHOLD - time_since_owner_active) / 60
+      )
+      logger.info(
+          f"صاحب الحساب نشط (قبل {int(time_since_owner_active)} ثانية). متبقي"
+          f" {mins_left} دقيقة لتفعيل الردود."
+      )
+      return
 
-    # 2. منع تكرار الرد (الرد مرة واحدة كل 30 دقيقة للشخص الواحد)
-    if chat_id in LAST_REPLIED:
-      time_passed = current_time - LAST_REPLIED[chat_id]
-      if time_passed < COOLDOWN_SECONDS:
-        logger.info(
-            f"تم تخطي الرد للمستخدم {chat_id} لوجود رد حديث قبل"
-            f" {int(time_passed)} ثانية."
-        )
-        return
+    # 3. معالجة ردود المستخدم:
+    conv = USER_CONVERSATIONS.get(chat_id)
 
-    # تسجيل وقت الرد الجديد
-    LAST_REPLIED[chat_id] = current_time
+    # أ) الرسالة الأولى (أو بعد غياب أكثر من 30 دقيقة):
+    if not conv or (current_time - conv["last_msg_time"]) > 30 * 60:
+      USER_CONVERSATIONS[chat_id] = {
+          "count": 1,
+          "last_msg_time": current_time,
+      }
+      reply_text = "انتضر ردي انا الان غير متواجد حاليا🥰"
+      await message.reply(reply_text)
+      logger.info(f"تم إرسال الرد 1 للمستخدم: {chat_id}")
+      return
 
-    # 3. إرسال الرد التلقائي
-    reply_text = "أهلاً بك! أنا غير متواجد حالياً، هذه رسالة رد تلقائي."
-    await message.reply(reply_text)
-    logger.info(f"تم إرسال رد تلقائي بنجاح إلى: {chat_id}")
+    diff = current_time - conv["last_msg_time"]
+    count = conv["count"]
+
+    # ب) الرسالة الثانية (في أقل من دقيقتين = 120 ثانية):
+    if count == 1:
+      if diff <= 120:
+        USER_CONVERSATIONS[chat_id] = {
+            "count": 2,
+            "last_msg_time": current_time,
+        }
+        reply_text = "انتضرني يا صديقي انا غير موجود 🙂🫶"
+        await message.reply(reply_text)
+        logger.info(f"تم إرسال الرد 2 للمستخدم: {chat_id}")
+      else:
+        conv["last_msg_time"] = current_time
+      return
+
+    # ج) الرسالة الثالثة (في أقل من 3 دقائق = 180 ثانية):
+    elif count == 2:
+      if diff <= 180:
+        USER_CONVERSATIONS[chat_id] = {
+            "count": 3,
+            "last_msg_time": current_time,
+        }
+        reply_text = "يا اخي تحلى بل صبر ماذا دهاك😑"
+        await message.reply(reply_text)
+        logger.info(f"تم إرسال الرد 3 للمستخدم: {chat_id}")
+      else:
+        conv["last_msg_time"] = current_time
+      return
+
+    # د) أكثر من 3 رسائل:
+    else:
+      conv["last_msg_time"] = current_time
+      logger.info(f"تم تخطي الرد للمستخدم {chat_id} لتجاوز 3 رسائل متتالية.")
+      return
 
   except Exception as e:
     logger.error(f"خطأ أثناء معالجة الرسالة: {e}")
@@ -59,16 +115,12 @@ async def handle_business_message(message: types.Message):
 # أمر /start
 @dp.message(CommandStart())
 async def handle_start(message: types.Message):
-  await message.answer(
-      "أهلاً بك! هذا البوت مخصص للردود التلقائية الذكية عبر Telegram Business."
-  )
+  await message.answer("أهلاً بك! البوت مبرمج بالقواعد الذكية للردود التلقائية.")
 
 
-# خادم ويب لإبقاء Render نشطاً
+# سيرفر ويب لـ Render
 async def health_check(request):
-  return web.Response(
-      text="Telegram Business Bot is running smoothly!", status=200
-  )
+  return web.Response(text="Bot is running with custom rules!", status=200)
 
 
 async def start_web_server():
@@ -86,16 +138,15 @@ async def start_web_server():
 
 async def main():
   if not bot:
-    logger.error("يرجى تعيين BOT_TOKEN في إعدادات Render.")
+    logger.error("يرجى ضبط BOT_TOKEN في Render.")
     await start_web_server()
     while True:
       await asyncio.sleep(3600)
     return
 
   await start_web_server()
-  # حذف أي Webhook قديم لتفادي التعارض
   await bot.delete_webhook(drop_pending_updates=True)
-  logger.info("بدء الاستماع للرسائل...")
+  logger.info("بدء الاستماع للرسائل بالقواعد الجديدة...")
   await dp.start_polling(bot)
 
 
