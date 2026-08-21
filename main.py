@@ -1,74 +1,67 @@
 import asyncio
 import logging
 import os
-import random
 import time
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 import aiohttp
 from aiohttp import web
 
-# إعداد التسجيل
+# إعداد التسجيل (Logging)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # قراءة المفاتيح من المتغيرات البيئية في Render
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
-OPENROUTER_API_KEY = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+OPENROUTER_API_KEY = (
+    os.getenv("OPENROUTER_API_KEY") or os.getenv("AI_API_KEY") or ""
+).strip()
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
 
-# مدة الخمول لتفعيل الردود (1 دقيقة = 60 ثانية)
+# مدة الخمول لتفعيل الردود الذكية (1 دقيقة = 60 ثانية)
 OWNER_INACTIVITY_THRESHOLD = 60
 LAST_OWNER_ACTIVITY = 0
 
 # الحد الأقصى للردود لكل مستخدم (10 رسائل)
 MAX_REPLIES_PER_USER = 10
+
+# ذاكرة المحادثات للاحتفاظ بالسياق: {chat_id: {"count": int, "last_msg_time": float, "history": list}}
 USER_CONVERSATIONS = {}
 
-# شخصية الذكاء الاصطناعي: إنسان عراقي واقعي ولطيف يتحدث في محادثة تيليجرام
+# شخصية الذكاء الاصطناعي الواقعية العفوية
 SYSTEM_PROMPT = (
-    "أنت شخص عراقي واقعي ولطيف جداً تجاوب في التليجرام نيابة عن صاحب الحساب"
-    " (هو طالع أو مشغول مو يم التلفون هسه).\n"
+    "أنت شخص عراقي واقعي ولطيف جداً تجاوب في محادثة تليجرام خاصة نيابة عن صاحب"
+    " الحساب (صاحب الحساب مو يمه التلفون هسه طالع أو مشغول).\n"
     "قواعد الحديث:\n"
-    "1. تحدث مثل شاب عراقي طبيعي جداً وواقعي بلهجة بغدادية/عراقية عفوية ومحترمة"
-    " (استخدم: هلا بيك عيوني، حبيبي، شخبارك، شكو ماكو، تدلل، ههههه، فدوه"
-    " لعينك، هسه هو مو يمه التلفون، بس يرجع يراسلك).\n"
-    "2. لا تتكلم كأنك روبوت أو بوت أو نظام رسمي أبداً! تكلم كأنك صديقه أو"
-    " أخوه اللي ماسك تلفونه ودا يجاوب عنه.\n"
-    "3. جاوب على قد السؤال وبشكل ذكي ومختصر وممتع، وكل رسالة جاوبها بأسلوب"
-    " مختلف تماماً عن اللي قبلها حسب كلام الشخص."
+    "1. تحدث مثل إنسان عراقي حقيقي وبشري 100% بلهجة عراقية/بغدادية عفوية وطبيعية"
+    " ومحترمة (استخدم: هلا عيوني، حبيبي، شخبارك، شكو ماكو، دومك يارب، تدلل،"
+    " ههههه، فدوه لعينك، لا تاكل هم، هسه هو مو يمه التلفون بس يرجع يحاجيك).\n"
+    "2. افهم سياق الكلام السابق وجاوب بدقة على كل سؤال (إذا سأل شوكت يرجع قله"
+    " عنده شغلة طالع ساعة زمان ويرجع، إذا سلم رد السلام، إذا شكرك رد بتدلل"
+    " وتكرم).\n"
+    "3. ممنوع التحدث كبوت أو نظام آلي أو تكرار نفس الجملة! كل رسالة لها رد"
+    " فريد وذكي ومختصر ومناسب لسياقها."
 )
 
-# ردود عراقية واقعية متنوعة للاحتياط الذكي
-FALLBACK_VARIATIONS = [
-    "هلا بيك عيوني، صاحب الحساب مو يمه التلفون هسه، بس يفرغ يرجعلك خبر إن"
-    " شاء الله ❤️",
-    "حبيبي تدلل، اول ما يرجع يشوف رسالتك ويجاوبك باسرع وقت 👍",
-    "هلا والله، شكو ماكو؟ تره هو شوي مشغول، بس يفتح نت يراسلك عيوني 🥰",
-    "وصلت رسالتك يعمري، لا تاكل هم بس يفرغ يجاوبك بنفسه 🌹",
-]
 
-
-async def query_gemini_direct(user_message: str) -> str:
-  """الاتصال المباشر بخوادم Google Gemini REST API"""
+async def query_gemini(messages_history: list) -> str:
+  """الاتصال المباشر بمحرك Google Gemini REST API مع تمرير سياق المحادثة"""
   if not GEMINI_API_KEY:
     return ""
 
-  models_to_try = [
-      "gemini-1.5-flash",
-      "gemini-2.0-flash",
-      "gemini-1.5-flash-latest",
-  ]
-  for m in models_to_try:
+  gemini_contents = []
+  for msg in messages_history:
+    role = "user" if msg["role"] == "user" else "model"
+    gemini_contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+
+  models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest"]
+  for m in models:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": f"التعليمات: {SYSTEM_PROMPT}\n\nرسالة المتصل:"
-                 f" {user_message}"}
-            ]
-        }],
-        "generationConfig": {"temperature": 0.85, "maxOutputTokens": 150},
+        "contents": gemini_contents,
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "generationConfig": {"temperature": 0.85, "maxOutputTokens": 180},
     }
     try:
       async with aiohttp.ClientSession() as session:
@@ -84,16 +77,13 @@ async def query_gemini_direct(user_message: str) -> str:
               text = parts[0]["text"].strip()
               logger.info(f"✅ تم توليد الرد بنجاح عبر Gemini ({m})")
               return text
-          else:
-            err = await resp.text()
-            logger.error(f"خطأ Gemini ({m} - {resp.status}): {err}")
     except Exception as e:
       logger.error(f"استثناء Gemini ({m}): {e}")
   return ""
 
 
-async def query_openrouter_direct(user_message: str) -> str:
-  """الاتصال الاحتياطي بخوادم OpenRouter"""
+async def query_openrouter(messages_history: list) -> str:
+  """الاتصال الاحتياطي بمحرك OpenRouter مع سياق المحادثة"""
   if not OPENROUTER_API_KEY:
     return ""
 
@@ -104,6 +94,7 @@ async def query_openrouter_direct(user_message: str) -> str:
       "X-Title": "Telegram Iraqi AI Bot",
       "Content-Type": "application/json",
   }
+  msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + messages_history
   models = [
       "meta-llama/llama-3.3-70b-instruct:free",
       "google/gemini-2.0-flash-exp:free",
@@ -111,11 +102,8 @@ async def query_openrouter_direct(user_message: str) -> str:
   for m in models:
     payload = {
         "model": m,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        "max_tokens": 150,
+        "messages": msgs,
+        "max_tokens": 180,
         "temperature": 0.8,
     }
     try:
@@ -132,27 +120,58 @@ async def query_openrouter_direct(user_message: str) -> str:
                 .strip()
             )
             if text:
-              logger.info(f"✅ تم توليد الرد بنجاح عبر OpenRouter ({m})")
+              logger.info(f"✅ تم توليد الرد عبر OpenRouter ({m})")
               return text
     except Exception as e:
       logger.error(f"استثناء OpenRouter: {e}")
   return ""
 
 
-async def generate_ai_reply(user_message: str) -> str:
-  """توليد الرد الذكي العراقي الواقعي"""
-  # 1. المحاولة أولاً عبر Google Gemini المباشر
-  reply = await query_gemini_direct(user_message)
-  if reply:
-    return reply
+async def query_pollinations_direct(messages_history: list) -> str:
+  """محرك ذكاء اصطناعي فوري مباشر مجاني لضمان عدم توقف الذكاء أبداً"""
+  url = "https://text.pollinations.ai/openai"
+  msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + messages_history
+  payload = {"messages": msgs, "model": "openai", "temperature": 0.8}
+  try:
+    async with aiohttp.ClientSession() as session:
+      async with session.post(url, json=payload, timeout=8) as resp:
+        if resp.status == 200:
+          data = await resp.json()
+          text = (
+              data.get("choices", [{}])[0]
+              .get("message", {})
+              .get("content", "")
+              .strip()
+          )
+          if text:
+            logger.info("✅ تم توليد الرد عبر المحرك السحابي الفوري.")
+            return text
+  except Exception as e:
+    logger.error(f"استثناء المحرك الفوري: {e}")
+  return ""
 
-  # 2. المحاولة ثانياً عبر OpenRouter إذا كان متاحاً
-  reply = await query_openrouter_direct(user_message)
-  if reply:
-    return reply
 
-  # 3. رد احتياطي عراقي عفوي متنوع
-  return random.choice(FALLBACK_VARIATIONS)
+async def generate_smart_ai_reply(history: list) -> str:
+  """توليد الرد الذكي المعتمد على الذكاء الاصطناعي وسياق المحادثة بالكامل"""
+  # 1. التجربة عبر Google Gemini
+  ans = await query_gemini(history)
+  if ans:
+    return ans
+
+  # 2. التجربة عبر OpenRouter
+  ans = await query_openrouter(history)
+  if ans:
+    return ans
+
+  # 3. التجربة عبر المحرك السحابي الفوري المباشر
+  ans = await query_pollinations_direct(history)
+  if ans:
+    return ans
+
+  return (
+      "هلا بيك عيوني، صاحب الحساب شوي طالع وما يمه الفون، بس يفرغ يرجعلك خبر إن"
+      " شاء الله ❤️"
+  )
 
 
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
@@ -166,6 +185,9 @@ async def handle_business_message(message: types.Message):
   current_time = time.time()
   chat_id = message.chat.id
   text = message.text or message.caption or ""
+
+  if not text:
+    return
 
   try:
     # 1. إذا كنت أنت من يكتب في المحادثة (أنت نشط حالياً):
@@ -183,29 +205,43 @@ async def handle_business_message(message: types.Message):
       logger.info(f"أنت نشط حالياً (متبقي {secs_left} ثانية لتفعيل الرد).")
       return
 
-    # 3. التحقق من حد الـ 10 رسائل لكل مستخدم:
+    # 3. إدارة ذاكرة وسياق المحادثة:
     conv = USER_CONVERSATIONS.setdefault(
-        chat_id, {"count": 0, "last_msg_time": current_time}
+        chat_id,
+        {"count": 0, "last_msg_time": current_time, "history": []},
     )
 
-    if (current_time - conv["last_msg_time"]) > 3600:
+    # تصفير المحادثة إذا مرت أكثر من ساعتين على آخر رسالة
+    if (current_time - conv["last_msg_time"]) > 7200:
       conv["count"] = 0
+      conv["history"] = []
 
+    # التحقق من حد الـ 10 رسائل
     if conv["count"] >= MAX_REPLIES_PER_USER:
       logger.info(
           f"المستخدم {chat_id} وصل للحد الأقصى (10 رسائل). تم التخطي."
       )
       return
 
-    # 4. توليد الرد العراقي الواقعي بالذكاء الاصطناعي:
+    # إضافة رسالة المستخدم الجديدة إلى سجل المحادثة
+    conv["history"].append({"role": "user", "content": text})
+    # الاحتفاظ بآخر 10 رسائل فقط في الذاكرة لتوفير السرعة
+    if len(conv["history"]) > 10:
+      conv["history"] = conv["history"][-10:]
+
     conv["count"] += 1
     conv["last_msg_time"] = current_time
 
-    reply_text = await generate_ai_reply(text)
+    # 4. توليد الرد الذكي المعتمد على كامل سياق الحوار بالذكاء الاصطناعي:
+    reply_text = await generate_smart_ai_reply(conv["history"])
+
+    # حفظ رد البوت في الذاكرة للمتابعة في الرسائل القادمة
+    conv["history"].append({"role": "assistant", "content": reply_text})
+
     await message.reply(reply_text)
     logger.info(
-        f"تم إرسال الرد الذكي ({conv['count']}/{MAX_REPLIES_PER_USER}) لـ:"
-        f" {chat_id}"
+        f"تم إرسال الرد الذكي المتسلسل ({conv['count']}/{MAX_REPLIES_PER_USER})"
+        f" لـ: {chat_id}"
     )
 
   except Exception as e:
@@ -216,15 +252,15 @@ async def handle_business_message(message: types.Message):
 @dp.message(CommandStart())
 async def handle_start(message: types.Message):
   await message.answer(
-      "أهلاً بك! البوت مبرمج بالذكاء الاصطناعي للردود التلقائية الواقعية باللهجة"
-      " العراقية."
+      "أهلاً بك! البوت مبرمج بالذكاء الاصطناعي المتطور للردود المتسلسلة والذكية"
+      " باللهجة العراقية."
   )
 
 
 # خادم ويب لإبقاء Render نشطاً
 async def health_check(request):
   return web.Response(
-      text="Telegram Business Iraqi AI Bot is running smoothly!", status=200
+      text="Telegram Business AI Bot with Context is running!", status=200
   )
 
 
@@ -243,17 +279,4 @@ async def start_web_server():
 
 async def main():
   if not bot:
-    logger.error("يرجى تعيين BOT_TOKEN في إعدادات Render.")
-    await start_web_server()
-    while True:
-      await asyncio.sleep(3600)
-    return
-
-  await start_web_server()
-  await bot.delete_webhook(drop_pending_updates=True)
-  logger.info("بدء الاستماع للرسائل بالذكاء الاصطناعي الواقعي...")
-  await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-  asyncio.run(main())
+    logger.
