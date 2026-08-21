@@ -12,3 +12,7 @@ services:
         sync: false
       - key: OPENROUTER_API_KEY
         sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: OWNER_TELEGRAM_ID
+        sync: false
