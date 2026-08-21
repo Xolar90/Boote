@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import time
 import json
 from typing import Dict, Any, List
@@ -12,7 +13,7 @@ from aiogram.types import Message, BusinessConnection
 from aiohttp import web
 import aiohttp
 
-# ==================== إعداد التسجيل ====================
+# ==================== التسجيل ====================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -28,59 +29,65 @@ OPENROUTER_API_KEY = (
 ).strip()
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
 
-# ==================== إعدادات السلوك ====================
-OWNER_INACTIVITY_THRESHOLD = 90          # 90 ثانية خمول قبل الرد
-MAX_REPLIES_PER_USER = 15
-HISTORY_LIMIT = 14
-CONVERSATION_RESET_AFTER = 7200
+# ==================== الإعدادات المطلوبة ====================
+MAX_REPLIES_PER_USER = 3                 # 3 ردود فقط لكل شخص
+REPLY_WINDOW_SECONDS = 7200              # كل ساعتين (2 × 60 × 60)
+OWNER_INACTIVITY_THRESHOLD = 60          # ثانية خمول قبل البدء بالرد
 
 # ==================== الذاكرة ====================
+# {chat_id: {"count": int, "window_start": float, "history": list}}
 USER_CONVERSATIONS: Dict[int, Dict[str, Any]] = {}
 LAST_OWNER_ACTIVITY: float = 0.0
 OWNER_ID: int | None = None
-# مجموعة إضافية من المعرفات التي نعتبرها "صاحب الحساب" (يمكن توسيعها يدوياً)
 OWNER_IDS: set[int] = set()
 
-# ==================== شخصية البوت ====================
+# ==================== الشخصية ====================
 SYSTEM_PROMPT = (
     "أنت شخص عراقي واقعي ولطيف جداً تجاوب في محادثة تليجرام خاصة نيابة عن صاحب "
     "الحساب (صاحب الحساب مو يمه التلفون هسه طالع أو مشغول).\n\n"
-    "قواعد الحديث الإلزامية:\n"
-    "1. تحدث مثل إنسان عراقي حقيقي 100% بلهجة عراقية/بغدادية عفوية وطبيعية ومحترمة.\n"
-    "   كلمات مفيدة: هلا عيوني، حبيبي، شخبارك، شكو ماكو، دومك يارب، تدلل، ههههه، "
-    "فدوه لعينك، لا تاكل هم، هسه هو مو يمه التلفون بس يرجع يحاجيك.\n"
-    "2. افهم سياق الكلام السابق جيداً وجاوب بدقة:\n"
-    "   - إذا سأل «شوكت يرجع» أو «متى يرجع» → قل عنده شغلة طالع تقريباً ساعة ويرجع.\n"
-    "   - إذا سلم → رد السلام بلطف.\n"
-    "   - إذا شكرك → رد بتدلل وتكرم.\n"
-    "   - إذا سأل «شنو» أو «شبيك» أو «وزي» → جاوب بطريقة طبيعية حسب السياق.\n"
-    "3. ممنوع تماماً:\n"
-    "   - التحدث كبوت أو نظام آلي.\n"
-    "   - تكرار نفس الجملة أو نفس الرد.\n"
-    "   - الردود الطويلة (خليها قصيرة وطبيعية).\n"
-    "4. كل رسالة لازم يكون لها رد فريد وذكي ومناسب للسياق."
+    "قواعد إلزامية:\n"
+    "1. لهجة عراقية/بغدادية عفوية وطبيعية 100% (هلا عيوني، حبيبي، شخبارك، شكو ماكو، "
+    "دومك يارب، تدلل، ههههه، فدوه لعينك، لا تاكل هم).\n"
+    "2. افهم السياق وجاوب بدقة ومختصر.\n"
+    "3. ممنوع التحدث كبوت أو تكرار نفس الجملة.\n"
+    "4. كل رد فريد وذكي ومناسب للرسالة.\n"
+    "5. إذا أرسل المستخدم رابط أو لينك → قل له إن صاحب الحساب لما يرجع بيشوف الرابط اللي أرسله."
 )
+
+# ==================== كشف الروابط ====================
+URL_PATTERN = re.compile(
+    r"(https?://[^\s]+)|(www\.[^\s]+)|(t\.me/[^\s]+)|(telegram\.me/[^\s]+)",
+    re.IGNORECASE,
+)
+
+def contains_link(text: str) -> bool:
+    return bool(URL_PATTERN.search(text or ""))
+
 
 # ==================== ردود احتياطية ذكية ومتنوعة ====================
 def get_smart_fallback(user_text: str, history: List[dict] | None = None) -> str:
-    """رد ذكي محلي يفهم نوع السؤال ويتجنب التكرار"""
     text = (user_text or "").strip().lower()
-
-    # جمع الردود السابقة لتجنب التكرار
-    previous_replies = set()
+    previous = set()
     if history:
         for h in history:
             if h.get("role") == "assistant":
-                previous_replies.add(h.get("content", "").strip())
+                previous.add(h.get("content", "").strip())
 
     def pick(options: list[str]) -> str:
-        available = [o for o in options if o not in previous_replies]
-        if not available:
-            available = options
-        return random.choice(available)
+        available = [o for o in options if o not in previous]
+        return random.choice(available if available else options)
+
+    # رابط
+    if contains_link(user_text):
+        return pick([
+            "تمام عيوني، لما يرجع صاحب الحساب بيشوف الرابط اللي أرسلته إن شاء الله ❤️",
+            "وصل الرابط، هسه هو مو يمه الفون بس لما يرجع يشوفه تدلل",
+            "حاضر، سجّلت الرابط، يرجع صاحب الحساب ويشوفه قريب إن شاء الله",
+            "الرابط واصل عيوني، بيوصله لما يرجع يحاجيك 🔗",
+        ])
 
     # تحيات
-    if any(w in text for w in ["هلا", "هلو", "مرحبا", "السلام", "سلام عليكم", "هاي", "أهلا", "اهلا"]):
+    if any(w in text for w in ["هلا", "هلو", "مرحبا", "السلام", "سلام", "هاي", "أهلا", "اهلا"]):
         return pick([
             "هلا بيك عيوني ❤️ شخبارك؟",
             "هلا والله حبيبي، شلونك؟",
@@ -89,36 +96,33 @@ def get_smart_fallback(user_text: str, history: List[dict] | None = None) -> str
             "وعليكم السلام حبيبي، شلونك؟",
         ])
 
-    # متى يرجع / شوكت
-    if any(w in text for w in ["شوكت", "متى", "يمتى", "وقت يرجع", "يرجع", "متى يرجع", "شوكت يرجع"]):
+    # متى يرجع
+    if any(w in text for w in ["شوكت", "متى", "يمتى", "يرجع", "وقت"]):
         return pick([
             "هسه هو طالع شغلة، تقريباً ساعة زمان ويرجع إن شاء الله ⏳",
             "ما يمه الفون هسه، بس يفرغ يرجعلك خبر خلال ساعة أو أقل ❤️",
             "عنده شغل برا، يرجع قريب إن شاء الله، لا تاكل هم",
             "شوي مشغول، بس يرجع يحاجيك بأقرب وقت تدلل",
-            "يرجع قريب إن شاء الله، خلينا ننتظره شوية",
         ])
 
-    # شنو / ماذا / وضح
-    if any(w in text for w in ["شنو", "ماذا", "ما هو", "ايش", "وشو", "قصدك"]):
+    # شنو / ماذا
+    if any(w in text for w in ["شنو", "ماذا", "ايش", "وشو", "قصدك"]):
         return pick([
             "ههه شنو بالضبط؟ وضحلي أكثر عيوني",
             "ما فهمت زين، عيد السؤال لو سمحت حبيبي",
             "قصدك شنو بالضبط؟ قلي أكثر تفاصيل",
-            "مو واضح عندي، اشرح أكثر تدلل",
         ])
 
-    # شبيك / شلك / وينك
-    if any(w in text for w in ["شبيك", "شلك", "وينك", "وين صرت", "شلونك", "شخبارك"]):
+    # شبيك / شلونك
+    if any(w in text for w in ["شبيك", "شلك", "وينك", "شلونك", "شخبارك"]):
         return pick([
             "والله تمام الحمد لله، بس صاحب الحساب مو يمه الفون هسه ❤️",
             "زين الحمد لله، هو طالع شغلة ويرجع قريب",
             "بخير تدلل، بس هو مشغول شوي حالياً",
-            "الحمد لله تمام، يرجعك خبر قريب إن شاء الله",
         ])
 
-    # وزي / تمام / اوك
-    if any(w in text for w in ["وزي", "وزين", "تمام", "اوك", "اوكي", "طيب", "حاضر"]):
+    # وزي / تمام
+    if any(w in text for w in ["وزي", "وزين", "تمام", "اوك", "اوكي", "طيب"]):
         return pick([
             "تمام عيوني ❤️",
             "تدلل حبيبي",
@@ -126,48 +130,44 @@ def get_smart_fallback(user_text: str, history: List[dict] | None = None) -> str
             "زين، لا تاكل هم",
         ])
 
-    # لماذا نفس الرد / تكرر
-    if any(w in text for w in ["لماذا", "ليش", "نفس الرد", "تكرر", "نفس الشي", "نفس", "ليش ترد"]):
+    # لماذا / ليش
+    if any(w in text for w in ["لماذا", "ليش", "نفس", "تكرر"]):
         return pick([
-            "هههه آسف، صاحب الحساب مشغول واحنا نحاول نرد عنّه أحسن ما نقدر 😅",
-            "لأن هو مو يمه الفون هسه، بس يرجع يحاجيك بنفسه قريب إن شاء الله",
+            "هههه آسف، صاحب الحساب مشغول واحنا نحاول نرد عنّه 😅",
+            "لأن هو مو يمه الفون هسه، بس يرجع يحاجيك بنفسه قريب",
             "هسه الوضع شغلة، بس لا تاكل هم يرجعك خبر",
-            "المعذرة، نحاول نوصل الرسالة بأفضل شكل لين يرجع هو",
         ])
 
     # شكر
-    if any(w in text for w in ["شكرا", "شكراً", "مشكور", "تسلم", "يعطيك", "يسلمو"]):
+    if any(w in text for w in ["شكرا", "شكراً", "مشكور", "تسلم", "يعطيك"]):
         return pick([
             "تدلل عيوني ❤️",
             "تكرم حبيبي، أي وقت",
             "العفو والله، دومك يارب",
-            "ما يسوى حبيبي",
         ])
 
     # ضحك
-    if any(w in text for w in ["ههه", "هههه", "lol", "😂", "🤣", "هع"]):
+    if any(w in text for w in ["ههه", "هههه", "😂", "🤣"]):
         return pick([
             "ههههه والله 😂",
             "هههه تدلل",
             "ههههه عيوني",
-            "😂😂 دومك يارب",
         ])
 
-    # افتراضي متنوع
+    # افتراضي
     return pick([
         "هسه هو مو يمه التلفون، بس يرجع يحاجيك إن شاء الله ❤️",
         "صاحب الحساب طالع شغلة، يرجع قريب تدلل",
         "ما يمه الفون هسه، بس يفرغ يرجعلك خبر ⏳",
         "عيوني هو مشغول شوي، بس يرجعك إن شاء الله لا تاكل هم",
         "شوي صبر، يرجع قريب ويحاجيك بنفسه",
-        "هو برا شغلة، إن شاء الله يرجع بأقرب وقت",
     ])
 
 
 # ==================== محركات الذكاء الاصطناعي ====================
 async def query_gemini(messages_history: List[dict]) -> str:
     if not GEMINI_API_KEY:
-        logger.warning("⚠️ GEMINI_API_KEY غير موجود في Environment Variables")
+        logger.warning("⚠️ GEMINI_API_KEY غير موجود")
         return ""
 
     contents = []
@@ -175,31 +175,17 @@ async def query_gemini(messages_history: List[dict]) -> str:
         role = "user" if msg["role"] == "user" else "model"
         contents.append({"role": role, "parts": [{"text": msg["content"]}]})
 
-    models = [
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-8b",
-        "gemini-1.5-pro",
-        "gemini-1.5-flash-latest",
-    ]
+    models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-1.5-pro"]
 
     for model in models:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={GEMINI_API_KEY}"
-        )
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": contents,
             "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "generationConfig": {
-                "temperature": 0.95,
-                "maxOutputTokens": 220,
-                "topP": 0.95,
-                "topK": 40,
-            },
+            "generationConfig": {"temperature": 0.95, "maxOutputTokens": 200, "topP": 0.95},
         }
         try:
-            timeout = aiohttp.ClientTimeout(total=15)
+            timeout = aiohttp.ClientTimeout(total=14)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload) as resp:
                     body = await resp.text()
@@ -209,71 +195,45 @@ async def query_gemini(messages_history: List[dict]) -> str:
                         if candidates:
                             parts = candidates[0].get("content", {}).get("parts", [])
                             if parts and "text" in parts[0]:
-                                text = parts[0]["text"].strip()
-                                # تنظيف بسيط
-                                if text.startswith('"') and text.endswith('"'):
-                                    text = text[1:-1]
+                                text = parts[0]["text"].strip().strip('"')
                                 if text:
-                                    logger.info(f"✅ Gemini نجح ← {model}")
+                                    logger.info(f"✅ Gemini ← {model}")
                                     return text
-                        logger.warning(f"Gemini {model}: لا يوجد نص | {body[:200]}")
                     else:
-                        logger.error(f"❌ Gemini {model} status={resp.status} | {body[:350]}")
-                        # إذا كان الخطأ 400 أو 403 بسبب المفتاح، لا تجرب باقي النماذج
+                        logger.error(f"❌ Gemini {model} status={resp.status} | {body[:300]}")
                         if resp.status in (400, 403):
-                            logger.error("مشكلة في المفتاح أو الصلاحيات — توقف عن تجربة نماذج أخرى")
                             break
         except Exception as e:
-            logger.error(f"استثناء Gemini ({model}): {type(e).__name__}: {e}")
+            logger.error(f"استثناء Gemini ({model}): {e}")
     return ""
 
 
 async def query_groq(messages_history: List[dict]) -> str:
     if not GROQ_API_KEY:
         return ""
-
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + messages_history
-    models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]
-
-    for model in models:
-        payload = {
-            "model": model,
-            "messages": msgs,
-            "max_tokens": 200,
-            "temperature": 0.9,
-        }
+    for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+        payload = {"model": model, "messages": msgs, "max_tokens": 180, "temperature": 0.9}
         try:
-            timeout = aiohttp.ClientTimeout(total=12)
+            timeout = aiohttp.ClientTimeout(total=11)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, headers=headers, json=payload) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        text = (
-                            data.get("choices", [{}])[0]
-                            .get("message", {})
-                            .get("content", "")
-                            .strip()
-                        )
+                        text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                         if text:
-                            logger.info(f"✅ Groq نجح ← {model}")
+                            logger.info(f"✅ Groq ← {model}")
                             return text
-                    else:
-                        body = await resp.text()
-                        logger.warning(f"Groq {model} status={resp.status} | {body[:200]}")
         except Exception as e:
-            logger.error(f"استثناء Groq ({model}): {e}")
+            logger.error(f"استثناء Groq: {e}")
     return ""
 
 
 async def query_openrouter(messages_history: List[dict]) -> str:
     if not OPENROUTER_API_KEY:
         return ""
-
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -282,60 +242,51 @@ async def query_openrouter(messages_history: List[dict]) -> str:
         "Content-Type": "application/json",
     }
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + messages_history
-    models = [
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "google/gemini-2.0-flash-exp:free",
-        "microsoft/phi-3-mini-128k-instruct:free",
-    ]
-
-    for model in models:
-        payload = {
-            "model": model,
-            "messages": msgs,
-            "max_tokens": 200,
-            "temperature": 0.9,
-        }
+    for model in ["meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-exp:free"]:
+        payload = {"model": model, "messages": msgs, "max_tokens": 180, "temperature": 0.9}
         try:
-            timeout = aiohttp.ClientTimeout(total=14)
+            timeout = aiohttp.ClientTimeout(total=12)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, headers=headers, json=payload) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        text = (
-                            data.get("choices", [{}])[0]
-                            .get("message", {})
-                            .get("content", "")
-                            .strip()
-                        )
+                        text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                         if text:
-                            logger.info(f"✅ OpenRouter نجح ← {model}")
+                            logger.info(f"✅ OpenRouter ← {model}")
                             return text
         except Exception as e:
-            logger.error(f"استثناء OpenRouter ({model}): {e}")
+            logger.error(f"استثناء OpenRouter: {e}")
     return ""
 
 
-async def generate_smart_ai_reply(history: List[dict], last_user_text: str) -> str:
-    """Gemini → Groq → OpenRouter → رد ذكي محلي"""
-    for name, func in [
-        ("Gemini", query_gemini),
-        ("Groq", query_groq),
-        ("OpenRouter", query_openrouter),
-    ]:
+async def generate_reply(history: List[dict], last_user_text: str) -> str:
+    # إذا الرسالة تحتوي رابط → رد خاص حتى لو الـ AI شغال
+    if contains_link(last_user_text):
+        # نحاول AI أولاً، وإذا فشل نستخدم الرد الخاص بالروابط
+        for func in (query_gemini, query_groq, query_openrouter):
+            try:
+                ans = await func(history)
+                if ans and len(ans.strip()) > 2:
+                    return ans.strip()
+            except Exception:
+                pass
+        return get_smart_fallback(last_user_text, history)
+
+    for func in (query_gemini, query_groq, query_openrouter):
         try:
             ans = await func(history)
             if ans and len(ans.strip()) > 2:
                 return ans.strip()
         except Exception as e:
-            logger.error(f"فشل {name}: {e}")
+            logger.error(f"فشل AI: {e}")
 
-    logger.warning("⚠️ كل محركات الـ AI فشلت → استخدام الرد الذكي المحلي")
+    logger.warning("⚠️ كل محركات AI فشلت → رد محلي ذكي")
     return get_smart_fallback(last_user_text, history)
 
 
-# ==================== تهيئة البوت ====================
+# ==================== تهيئة ====================
 if not BOT_TOKEN:
-    logger.critical("❌ BOT_TOKEN غير موجود!")
+    logger.critical("❌ BOT_TOKEN غير موجود")
     bot = None
 else:
     bot = Bot(token=BOT_TOKEN)
@@ -344,14 +295,11 @@ dp = Dispatcher()
 
 
 def is_owner(user_id: int | None) -> bool:
-    """التحقق هل هذا المستخدم هو صاحب الحساب"""
     if user_id is None:
         return False
     if OWNER_ID and user_id == OWNER_ID:
         return True
-    if user_id in OWNER_IDS:
-        return True
-    return False
+    return user_id in OWNER_IDS
 
 
 # ==================== المعالجات ====================
@@ -360,8 +308,7 @@ async def on_business_connection(event: BusinessConnection):
     global OWNER_ID
     OWNER_ID = event.user.id
     OWNER_IDS.add(event.user.id)
-    status = "مفعّل" if event.is_enabled else "معطّل"
-    logger.info(f"🔗 Business Connection | owner_id={OWNER_ID} | {status}")
+    logger.info(f"🔗 Business Connection | owner_id={OWNER_ID} | enabled={event.is_enabled}")
 
 
 @dp.business_message(F.text)
@@ -380,75 +327,83 @@ async def handle_business_message(message: Message):
         return
 
     try:
-        # ========== 1. إذا الرسالة من صاحب الحساب → لا ترد أبداً ==========
+        # ========== لا ترد أبداً على رسائل صاحب الحساب ==========
         if is_owner(from_user_id):
             LAST_OWNER_ACTIVITY = current_time
+            # نمسح محادثة هذا الشخص حتى لا يرد لاحقاً بالخطأ
             USER_CONVERSATIONS.pop(chat_id, None)
-            logger.info(f"👤 صاحب الحساب كتب (id={from_user_id}) → تم التجاهل وتصفير المحادثة")
+            logger.info(f"👤 رسالة من صاحب الحساب (id={from_user_id}) → تجاهل تام")
             return
 
-        # ========== 2. فترة الخمول ==========
-        time_since = current_time - LAST_OWNER_ACTIVITY
-        if time_since < OWNER_INACTIVITY_THRESHOLD:
-            remaining = int(OWNER_INACTIVITY_THRESHOLD - time_since)
-            logger.info(f"⏳ صاحب الحساب لا يزال ضمن فترة النشاط (متبقي {remaining} ث) → لا رد")
+        # ========== فترة الخمول ==========
+        if (current_time - LAST_OWNER_ACTIVITY) < OWNER_INACTIVITY_THRESHOLD:
+            remaining = int(OWNER_INACTIVITY_THRESHOLD - (current_time - LAST_OWNER_ACTIVITY))
+            logger.info(f"⏳ صاحب الحساب نشط (متبقي {remaining} ث) → لا رد")
             return
 
-        # ========== 3. إدارة السياق ==========
+        # ========== إدارة الحد: 3 ردود كل ساعتين ==========
         conv = USER_CONVERSATIONS.setdefault(
-            chat_id, {"count": 0, "last_msg_time": current_time, "history": []}
+            chat_id,
+            {"count": 0, "window_start": current_time, "history": []},
         )
 
-        if (current_time - conv["last_msg_time"]) > CONVERSATION_RESET_AFTER:
+        # إذا مرت ساعتين → صفّر العداد وابدأ نافذة جديدة
+        if (current_time - conv["window_start"]) >= REPLY_WINDOW_SECONDS:
             conv["count"] = 0
+            conv["window_start"] = current_time
             conv["history"] = []
-            logger.info(f"🔄 تصفير سياق قديم لـ {chat_id}")
+            logger.info(f"🔄 نافذة جديدة (ساعتين) لـ {chat_id}")
 
+        # وصل الحد الأقصى (3 ردود)
         if conv["count"] >= MAX_REPLIES_PER_USER:
-            logger.info(f"🛑 وصل للحد الأقصى ({MAX_REPLIES_PER_USER}): {chat_id}")
+            logger.info(f"🛑 وصل لـ 3 ردود خلال ساعتين → توقف عن الرد لـ {chat_id}")
             return
 
-        # إضافة رسالة المستخدم
+        # ========== بناء السياق ==========
         conv["history"].append({"role": "user", "content": text})
-        if len(conv["history"]) > HISTORY_LIMIT:
-            conv["history"] = conv["history"][-HISTORY_LIMIT:]
+        if len(conv["history"]) > 10:
+            conv["history"] = conv["history"][-10:]
 
         conv["count"] += 1
-        conv["last_msg_time"] = current_time
 
-        # ========== 4. توليد الرد ==========
-        reply_text = await generate_smart_ai_reply(conv["history"], text)
+        # ========== توليد الرد ==========
+        reply_text = await generate_reply(conv["history"], text)
 
-        # منع التكرار المباشر لنفس الرد السابق
-        if conv["history"] and conv["history"][-1].get("role") == "assistant":
+        # منع تكرار آخر رد
+        if len(conv["history"]) >= 2 and conv["history"][-1].get("role") == "assistant":
             if conv["history"][-1].get("content", "").strip() == reply_text.strip():
                 reply_text = get_smart_fallback(text, conv["history"])
 
         conv["history"].append({"role": "assistant", "content": reply_text})
 
-        # ========== 5. إرسال الرد ==========
+        # ========== إرسال ==========
         await bot.send_message(
             chat_id=chat_id,
             text=reply_text,
             business_connection_id=message.business_connection_id,
             reply_to_message_id=message.message_id,
         )
-        logger.info(f"💬 رد ({conv['count']}/{MAX_REPLIES_PER_USER}) → {chat_id}: {reply_text[:50]}...")
+        logger.info(
+            f"💬 رد {conv['count']}/3 → {chat_id} | {reply_text[:45]}..."
+        )
 
     except Exception as e:
-        logger.exception(f"❌ خطأ معالجة رسالة من {chat_id}: {e}")
+        logger.exception(f"❌ خطأ: {e}")
 
 
 @dp.message(CommandStart())
 async def handle_start(message: Message):
     await message.answer(
-        "أهلاً بك! 👋\n"
-        "بوت الرد التلقائي الذكي لحسابات Telegram Business.\n"
-        "يرد باللهجة العراقية عندما تكون مشغولاً.\n\n"
+        "أهلاً بك 👋\n"
+        "بوت الرد التلقائي الذكي (Telegram Business)\n\n"
+        "القواعد:\n"
+        "• يرد فقط على من يراسلك (مو على رسائلك أنت)\n"
+        "• 3 ردود فقط لكل شخص كل ساعتين\n"
+        "• إذا أرسل أحد رابط → يخبره إنك راح تشوف الرابط لما ترجع\n\n"
         "الأوامر:\n"
-        "/status — حالة البوت والمفاتيح\n"
-        "/clear — تصفير ذاكرة المحادثات\n"
-        "/setowner — تسجيل نفسك كصاحب الحساب (مهم)"
+        "/setowner — سجّل نفسك كصاحب الحساب (مهم جداً)\n"
+        "/status — حالة البوت\n"
+        "/clear — تصفير الذاكرة"
     )
 
 
@@ -456,20 +411,14 @@ async def handle_start(message: Message):
 async def handle_status(message: Message):
     active = len(USER_CONVERSATIONS)
     inactive = int(time.time() - LAST_OWNER_ACTIVITY) if LAST_OWNER_ACTIVITY else "—"
-    gemini = "✅ موجود" if GEMINI_API_KEY else "❌ غير موجود"
-    groq = "✅ موجود" if GROQ_API_KEY else "❌ غير موجود"
-    openrouter = "✅ موجود" if OPENROUTER_API_KEY else "❌ غير موجود"
-    owner_info = f"{OWNER_ID}" if OWNER_ID else "لم يُسجَّل بعد"
+    owner = str(OWNER_ID) if OWNER_ID else "غير مسجل — استخدم /setowner"
     await message.answer(
-        f"📊 حالة البوت:\n\n"
+        f"📊 الحالة:\n\n"
+        f"• OWNER_ID: {owner}\n"
         f"• المحادثات النشطة: {active}\n"
-        f"• آخر نشاط لصاحب الحساب: قبل {inactive} ثانية\n"
-        f"• OWNER_ID المسجل: {owner_info}\n"
-        f"• Gemini: {gemini}\n"
-        f"• Groq: {groq}\n"
-        f"• OpenRouter: {openrouter}\n"
-        f"• حد الردود: {MAX_REPLIES_PER_USER}\n"
-        f"• عتبة الخمول: {OWNER_INACTIVITY_THRESHOLD} ثانية"
+        f"• آخر نشاط لك: قبل {inactive} ثانية\n"
+        f"• Gemini: {'✅' if GEMINI_API_KEY else '❌'}\n"
+        f"• حد الردود: {MAX_REPLIES_PER_USER} كل ساعتين"
     )
 
 
@@ -482,23 +431,25 @@ async def handle_clear(message: Message):
 
 @dp.message(Command("setowner"))
 async def handle_setowner(message: Message):
-    """يسجل من يرسل الأمر كصاحب الحساب (مهم إذا لم يصل business_connection)"""
+    """مهم جداً: سجّل نفسك حتى البوت ما يرد على رسائلك"""
     global OWNER_ID
     if not message.from_user:
         return
     OWNER_ID = message.from_user.id
     OWNER_IDS.add(OWNER_ID)
+    LAST_OWNER_ACTIVITY = time.time()
     await message.answer(
         f"✅ تم تسجيلك كصاحب الحساب\n"
         f"معرفك: `{OWNER_ID}`\n\n"
-        f"الآن البوت لن يرد على رسائلك أنت."
+        f"الآن البوت **لن يرد على رسائلك أبداً**.\n"
+        f"سيرد فقط على الأشخاص اللي يراسلونك."
     )
-    logger.info(f"تم تسجيل OWNER_ID يدوياً = {OWNER_ID}")
+    logger.info(f"✅ OWNER_ID سُجّل يدوياً = {OWNER_ID}")
 
 
 # ==================== خادم الويب ====================
 async def health_check(request: web.Request) -> web.Response:
-    return web.Response(text="Telegram Business AI Bot is running ✅", status=200)
+    return web.Response(text="Telegram Business AI Bot running ✅", status=200)
 
 
 async def start_web_server() -> None:
@@ -510,30 +461,19 @@ async def start_web_server() -> None:
     port = int(os.getenv("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"🌐 خادم الويب يعمل على المنفذ {port}")
+    logger.info(f"🌐 المنفذ {port}")
 
 
-# ==================== التشغيل ====================
 async def main() -> None:
     if not bot:
-        logger.critical("BOT_TOKEN مفقود — توقف")
+        logger.critical("BOT_TOKEN مفقود")
         return
-
     await start_web_server()
-
-    logger.info("🚀 بدء تشغيل البوت...")
-    logger.info(f"Gemini     : {'✅ مفعّل' if GEMINI_API_KEY else '❌ غير مفعّل'}")
-    logger.info(f"Groq       : {'✅ مفعّل' if GROQ_API_KEY else '❌ غير مفعّل'}")
-    logger.info(f"OpenRouter : {'✅ مفعّل' if OPENROUTER_API_KEY else '❌ غير مفعّل'}")
-
+    logger.info("🚀 البوت يعمل...")
+    logger.info(f"Gemini: {'✅' if GEMINI_API_KEY else '❌'} | حد الردود: 3 كل ساعتين")
     await dp.start_polling(
         bot,
-        allowed_updates=[
-            "message",
-            "business_message",
-            "business_connection",
-            "edited_business_message",
-        ],
+        allowed_updates=["message", "business_message", "business_connection", "edited_business_message"],
     )
 
 
@@ -541,4 +481,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("تم إيقاف البوت.")
+        logger.info("إيقاف")
