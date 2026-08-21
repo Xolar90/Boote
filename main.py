@@ -37,7 +37,7 @@ OWNER_ID_FROM_ENV: int | None = int(_OWNER_ENV) if _OWNER_ENV.isdigit() else Non
 # ==================== الإعدادات ====================
 MAX_REPLIES_PER_USER = 3
 REPLY_WINDOW_SECONDS = 7200              # ساعتان
-OWNER_INACTIVITY_THRESHOLD = 45          # ثانية
+OWNER_INACTIVITY_THRESHOLD = 30 * 60  # 30 دقيقة = 1800 ثانية
 
 # ==================== الذاكرة ====================
 USER_CONVERSATIONS: Dict[int, Dict[str, Any]] = {}
@@ -320,7 +320,9 @@ async def handle_business_message(message: Message):
         # ========== 2. فترة الخمول ==========
         if (current_time - LAST_OWNER_ACTIVITY) < OWNER_INACTIVITY_THRESHOLD:
             remaining = int(OWNER_INACTIVITY_THRESHOLD - (current_time - LAST_OWNER_ACTIVITY))
-            logger.info(f"⏳ خمول غير مكتمل (متبقي {remaining}ث) → لا رد")
+            mins = remaining // 60
+            secs = remaining % 60
+            logger.info(f"⏳ خمول غير مكتمل (متبقي {mins}د و {secs}ث) → لا رد")
             return
 
         # ========== 3. حد 3 ردود كل ساعتين ==========
@@ -395,7 +397,8 @@ async def handle_status(message: Message):
         f"• المحادثات النشطة: {active}\n"
         f"• آخر نشاط: قبل {inactive} ثانية\n"
         f"• Gemini: {'✅' if GEMINI_API_KEY else '❌'}\n"
-        f"• حد الردود: 3 كل ساعتين"
+        f"• حد الردود: 3 كل ساعتين\n"
+        f"• تفعيل البوت بعد: {OWNER_INACTIVITY_THRESHOLD // 60} دقيقة خمول"
     )
 
 
