@@ -4,8 +4,8 @@ import os
 import time
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
-import aiohttp
 from aiohttp import web
+import google.generativeai as genai
 
 # إعداد التسجيل
 logging.basicConfig(level=logging.INFO)
@@ -13,24 +13,45 @@ logger = logging.getLogger(__name__)
 
 # قراءة التوكنات من المتغيرات البيئية في Render
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-AI_API_KEY = (
-    os.getenv("AI_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
+GEMINI_API_KEY = (
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("AI_API_KEY")
+    or os.getenv("OPENROUTER_API_KEY")
+    or ""
 ).strip()
 
-if not AI_API_KEY:
-  logger.warning("⚠️ تنبيه: لم يتم ضبط AI_API_KEY في إعدادات Render!")
+# إعداد نموذج Google Gemini الرسمي
+if GEMINI_API_KEY:
+  try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        system_instruction=(
+            "أنت سكرتير ومساعد ذكي جداً ترد على الرسائل الخاصة في حساب تيليجرام"
+            " نيابة عن صاحب الحساب. صاحب الحساب غير متواجد حالياً وغائب عن"
+            " التيليجرام.\n"
+            "قواعد الرد:\n"
+            "1. تحدث دائماً بلهجة عراقية محترمة ولطيفة وودودة جداً (مثل: هلا"
+            " بيك عيوني، تدلل، ان شاء الله، حبيبي، صاحب الحساب ما متواجد"
+            " هسه).\n"
+            "2. جاوب مباشرة وبذكاء على كلام الشخص أو سؤاله مهما كان (إذا سأل"
+            " وين راح خبره إنه مشغول أو طالع هسه، وإذا سأل سؤال عام جاوبه عليه"
+            " باختصار ولطف).\n"
+            "3. ذكره بلباقة في نهاية جوابك إنه ينتظر رد صاحب الحساب أول ما"
+            " يفرغ يتواصل وياه.\n"
+            "4. اجعل الرد متفاعلاً وممتعاً حسب سياق كل رسالة بدون تكرار نفس"
+            " العبارة أبداً."
+        ),
+    )
+    logger.info("✅ تم تهيئة نموذج Google Gemini الرسمي بنجاح!")
+  except Exception as e:
+    logger.error(f"خطأ أثناء تهيئة Gemini: {e}")
+    model = None
 else:
-  logger.info("✅ تم تحميل مفتاح الذكاء الاصطناعي بنجاح.")
-
-# خوادم Bluesminds والنماذج المدعومة
-AI_BASE_URL = "https://api.bluesminds.com/v1/chat/completions"
-AI_MODELS = [
-    "gpt-3.5-turbo",
-    "gemini-1.5-flash",
-    "gpt-4o-mini",
-    "deepseek-chat",
-    "gpt-4o",
-]
+  model = None
+  logger.warning(
+      "⚠️ تنبيه: لم يتم العثور على GEMINI_API_KEY في إعدادات Render!"
+  )
 
 # مدة خمولك لتفعيل الرد الذكي (1 دقيقة = 60 ثانية)
 OWNER_INACTIVITY_THRESHOLD = 60
@@ -40,68 +61,27 @@ LAST_OWNER_ACTIVITY = 0
 MAX_REPLIES_PER_USER = 10
 USER_CONVERSATIONS = {}
 
-# تعليمات الذكاء الاصطناعي للرد على أي سؤال بلهجة عراقية
-SYSTEM_PROMPT = (
-    "أنت سكرتير ومساعد ذكي جداً ترد على الرسائل الخاصة في حساب تيليجرام نيابة"
-    " عن صاحب الحساب. صاحب الحساب غير متواجد حالياً. قواعد الرد:\n"
-    "1. تحدث دائماً بلهجة عراقية محترمة وودودة ولطيفة (مثل: هلا بيك عيوني،"
-    " تدلل، حبيبي، ان شاء الله، ما موجود هسه).\n"
-    "2. جاوب مباشرة وبذكاء على كلام الشخص أو سؤاله مهما كان (إذا سأل عن صاحب"
-    " الحساب خبره إنه طالع أو مشغول وما متواجد هسه، وإذا سأل سؤال عام جاوبه"
-    " عليه باختصار ولطف).\n"
-    "3. ذكره بلباقة في نهاية جوابك إنه ينتظر رد صاحب الحساب أول ما يفرغ يتواصل"
-    " وياه.\n"
-    "4. اجعل الرد متفاعلاً وممتعاً حسب سياق كل رسالة بدون تكرار نفس العبارة."
-)
-
 
 async def generate_ai_reply(user_message: str) -> str:
-  """توليد رد ذكي مخصص لكل سؤال بلهجة عراقية"""
+  """توليد الرد الذكي العراقي مباشرة عبر Google Gemini"""
   fallback_text = (
       "هلا بيك عيوني، صاحب الحساب ما متواجد حالياً، انتظر رده وأول ما يفرغ"
       " يتواصل وياك إن شاء الله 🥰"
   )
 
-  if not AI_API_KEY:
-    logger.warning("لم يتم العثور على AI_API_KEY في Render!")
+  if not model or not user_message:
     return fallback_text
 
-  headers = {
-      "Authorization": f"Bearer {AI_API_KEY}",
-      "Content-Type": "application/json",
-  }
-
-  for model_name in AI_MODELS:
-    payload = {
-        "model": model_name,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        "max_tokens": 180,
-    }
-
-    try:
-      async with aiohttp.ClientSession() as session:
-        async with session.post(
-            AI_BASE_URL, headers=headers, json=payload, timeout=10
-        ) as resp:
-          if resp.status == 200:
-            data = await resp.json()
-            ai_text = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
-            if ai_text:
-              logger.info(f"✅ تم توليد الرد بنجاح عبر نموذج ({model_name})")
-              return ai_text
-          else:
-            err = await resp.text()
-            logger.error(f"خطأ في النموذج {model_name}: {err}")
-    except Exception as e:
-      logger.error(f"خطأ اتصال بالنموذج {model_name}: {e}")
+  try:
+    loop = asyncio.get_running_loop()
+    response = await loop.run_in_executor(
+        None, model.generate_content, user_message
+    )
+    if response and response.text:
+      logger.info("✅ تم توليد الرد بنجاح عبر Google Gemini.")
+      return response.text.strip()
+  except Exception as e:
+    logger.error(f"خطأ أثناء استدعاء Google Gemini: {e}")
 
   return fallback_text
 
@@ -119,7 +99,7 @@ async def handle_business_message(message: types.Message):
   text = message.text or message.caption or ""
 
   try:
-    # 1. إذا كنت أنت من يكتب في المحادثة:
+    # 1. إذا كانت الرسالة صادرة منك أنت (أنت نشط حالياً):
     if message.chat.type == "private" and message.from_user.id != message.chat.id:
       LAST_OWNER_ACTIVITY = current_time
       if chat_id in USER_CONVERSATIONS:
@@ -129,7 +109,7 @@ async def handle_business_message(message: types.Message):
       )
       return
 
-    # 2. التحقق من غيابك لمدة 1 دقيقة:
+    # 2. التحقق من خمولك لمدة 1 دقيقة (60 ثانية):
     time_since_owner_active = current_time - LAST_OWNER_ACTIVITY
     if time_since_owner_active < OWNER_INACTIVITY_THRESHOLD:
       secs_left = int(OWNER_INACTIVITY_THRESHOLD - time_since_owner_active)
@@ -138,7 +118,7 @@ async def handle_business_message(message: types.Message):
       )
       return
 
-    # 3. التحقق من حد الـ 10 رسائل:
+    # 3. التحقق من حد الـ 10 رسائل لكل مستخدم:
     conv = USER_CONVERSATIONS.setdefault(
         chat_id, {"count": 0, "last_msg_time": current_time}
     )
@@ -152,7 +132,7 @@ async def handle_business_message(message: types.Message):
       )
       return
 
-    # 4. توليد الرد الذكي المخصص لكل رسالة:
+    # 4. توليد الرد الذكي المخصص لكل رسالة عبر Google Gemini:
     conv["count"] += 1
     conv["last_msg_time"] = current_time
 
@@ -171,15 +151,15 @@ async def handle_business_message(message: types.Message):
 @dp.message(CommandStart())
 async def handle_start(message: types.Message):
   await message.answer(
-      "أهلاً بك! البوت مبرمج بالذكاء الاصطناعي للردود التلقائية الذكية باللهجة"
-      " العراقية."
+      "أهلاً بك! البوت مبرمج بـ Google Gemini الرسمي للردود التلقائية الذكية"
+      " باللهجة العراقية."
   )
 
 
 # خادم ويب لإبقاء Render نشطاً
 async def health_check(request):
   return web.Response(
-      text="Telegram Business Iraqi AI Bot is running!", status=200
+      text="Telegram Business Gemini AI Bot is running!", status=200
   )
 
 
@@ -206,7 +186,7 @@ async def main():
 
   await start_web_server()
   await bot.delete_webhook(drop_pending_updates=True)
-  logger.info("بدء الاستماع للرسائل بالذكاء الاصطناعي...")
+  logger.info("بدء الاستماع للرسائل بالذكاء الاصطناعي من Google Gemini...")
   await dp.start_polling(bot)
 
 
