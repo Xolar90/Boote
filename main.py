@@ -75,10 +75,10 @@ async def query_gemini(messages_history: list) -> str:
             )
             if parts and "text" in parts[0]:
               text = parts[0]["text"].strip()
-              logger.info(f"✅ تم توليد الرد بنجاح عبر Gemini ({m})")
+              logger.info(f"تم توليد الرد بنجاح عبر Gemini: {m}")
               return text
     except Exception as e:
-      logger.error(f"استثناء Gemini ({m}): {e}")
+      logger.error(f"استثناء Gemini: {e}")
   return ""
 
 
@@ -120,7 +120,7 @@ async def query_openrouter(messages_history: list) -> str:
                 .strip()
             )
             if text:
-              logger.info(f"✅ تم توليد الرد عبر OpenRouter ({m})")
+              logger.info(f"تم توليد الرد عبر OpenRouter: {m}")
               return text
     except Exception as e:
       logger.error(f"استثناء OpenRouter: {e}")
@@ -144,7 +144,7 @@ async def query_pollinations_direct(messages_history: list) -> str:
               .strip()
           )
           if text:
-            logger.info("✅ تم توليد الرد عبر المحرك السحابي الفوري.")
+            logger.info("تم توليد الرد عبر المحرك السحابي الفوري.")
             return text
   except Exception as e:
     logger.error(f"استثناء المحرك الفوري: {e}")
@@ -240,8 +240,8 @@ async def handle_business_message(message: types.Message):
 
     await message.reply(reply_text)
     logger.info(
-        f"تم إرسال الرد الذكي المتسلسل ({conv['count']}/{MAX_REPLIES_PER_USER})"
-        f" لـ: {chat_id}"
+        f"تم إرسال الرد الذكي ({conv['count']}/{MAX_REPLIES_PER_USER}) لـ:"
+        f" {chat_id}"
     )
 
   except Exception as e:
@@ -252,16 +252,14 @@ async def handle_business_message(message: types.Message):
 @dp.message(CommandStart())
 async def handle_start(message: types.Message):
   await message.answer(
-      "أهلاً بك! البوت مبرمج بالذكاء الاصطناعي المتطور للردود المتسلسلة والذكية"
-      " باللهجة العراقية."
+      "أهلاً بك! البوت مبرمج بالذكاء الاصطناعي للردود التلقائية باللهجة"
+      " العراقية."
   )
 
 
 # خادم ويب لإبقاء Render نشطاً
 async def health_check(request):
-  return web.Response(
-      text="Telegram Business AI Bot with Context is running!", status=200
-  )
+  return web.Response(text="Telegram Business AI Bot is running!", status=200)
 
 
 async def start_web_server():
@@ -279,4 +277,17 @@ async def start_web_server():
 
 async def main():
   if not bot:
-    logger.
+    logger.error("يرجى تعيين BOT_TOKEN في إعدادات Render.")
+    await start_web_server()
+    while True:
+      await asyncio.sleep(3600)
+    return
+
+  await start_web_server()
+  await bot.delete_webhook(drop_pending_updates=True)
+  logger.info("بدء الاستماع للرسائل بالذكاء الاصطناعي...")
+  await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+  asyncio.run(main())
