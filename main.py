@@ -1,59 +1,23 @@
 import asyncio
 import logging
 import os
+import random
 import time
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
+import aiohttp
 from aiohttp import web
-import google.generativeai as genai
 
 # إعداد التسجيل
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# قراءة التوكنات من المتغيرات البيئية في Render
+# قراءة المفاتيح من المتغيرات البيئية في Render
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-GEMINI_API_KEY = (
-    os.getenv("GEMINI_API_KEY")
-    or os.getenv("AI_API_KEY")
-    or os.getenv("OPENROUTER_API_KEY")
-    or ""
-).strip()
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+OPENROUTER_API_KEY = (os.getenv("OPENROUTER_API_KEY") or "").strip()
 
-# إعداد نموذج Google Gemini الرسمي
-if GEMINI_API_KEY:
-  try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
-        system_instruction=(
-            "أنت سكرتير ومساعد ذكي جداً ترد على الرسائل الخاصة في حساب تيليجرام"
-            " نيابة عن صاحب الحساب. صاحب الحساب غير متواجد حالياً وغائب عن"
-            " التيليجرام.\n"
-            "قواعد الرد:\n"
-            "1. تحدث دائماً بلهجة عراقية محترمة ولطيفة وودودة جداً (مثل: هلا"
-            " بيك عيوني، تدلل، ان شاء الله، حبيبي، صاحب الحساب ما متواجد"
-            " هسه).\n"
-            "2. جاوب مباشرة وبذكاء على كلام الشخص أو سؤاله مهما كان (إذا سأل"
-            " وين راح خبره إنه مشغول أو طالع هسه، وإذا سأل سؤال عام جاوبه عليه"
-            " باختصار ولطف).\n"
-            "3. ذكره بلباقة في نهاية جوابك إنه ينتظر رد صاحب الحساب أول ما"
-            " يفرغ يتواصل وياه.\n"
-            "4. اجعل الرد متفاعلاً وممتعاً حسب سياق كل رسالة بدون تكرار نفس"
-            " العبارة أبداً."
-        ),
-    )
-    logger.info("✅ تم تهيئة نموذج Google Gemini الرسمي بنجاح!")
-  except Exception as e:
-    logger.error(f"خطأ أثناء تهيئة Gemini: {e}")
-    model = None
-else:
-  model = None
-  logger.warning(
-      "⚠️ تنبيه: لم يتم العثور على GEMINI_API_KEY في إعدادات Render!"
-  )
-
-# مدة خمولك لتفعيل الرد الذكي (1 دقيقة = 60 ثانية)
+# مدة الخمول لتفعيل الردود (1 دقيقة = 60 ثانية)
 OWNER_INACTIVITY_THRESHOLD = 60
 LAST_OWNER_ACTIVITY = 0
 
@@ -61,29 +25,134 @@ LAST_OWNER_ACTIVITY = 0
 MAX_REPLIES_PER_USER = 10
 USER_CONVERSATIONS = {}
 
+# شخصية الذكاء الاصطناعي: إنسان عراقي واقعي ولطيف يتحدث في محادثة تيليجرام
+SYSTEM_PROMPT = (
+    "أنت شخص عراقي واقعي ولطيف جداً تجاوب في التليجرام نيابة عن صاحب الحساب"
+    " (هو طالع أو مشغول مو يم التلفون هسه).\n"
+    "قواعد الحديث:\n"
+    "1. تحدث مثل شاب عراقي طبيعي جداً وواقعي بلهجة بغدادية/عراقية عفوية ومحترمة"
+    " (استخدم: هلا بيك عيوني، حبيبي، شخبارك، شكو ماكو، تدلل، ههههه، فدوه"
+    " لعينك، هسه هو مو يمه التلفون، بس يرجع يراسلك).\n"
+    "2. لا تتكلم كأنك روبوت أو بوت أو نظام رسمي أبداً! تكلم كأنك صديقه أو"
+    " أخوه اللي ماسك تلفونه ودا يجاوب عنه.\n"
+    "3. جاوب على قد السؤال وبشكل ذكي ومختصر وممتع، وكل رسالة جاوبها بأسلوب"
+    " مختلف تماماً عن اللي قبلها حسب كلام الشخص."
+)
+
+# ردود عراقية واقعية متنوعة للاحتياط الذكي
+FALLBACK_VARIATIONS = [
+    "هلا بيك عيوني، صاحب الحساب مو يمه التلفون هسه، بس يفرغ يرجعلك خبر إن"
+    " شاء الله ❤️",
+    "حبيبي تدلل، اول ما يرجع يشوف رسالتك ويجاوبك باسرع وقت 👍",
+    "هلا والله، شكو ماكو؟ تره هو شوي مشغول، بس يفتح نت يراسلك عيوني 🥰",
+    "وصلت رسالتك يعمري، لا تاكل هم بس يفرغ يجاوبك بنفسه 🌹",
+]
+
+
+async def query_gemini_direct(user_message: str) -> str:
+  """الاتصال المباشر بخوادم Google Gemini REST API"""
+  if not GEMINI_API_KEY:
+    return ""
+
+  models_to_try = [
+      "gemini-1.5-flash",
+      "gemini-2.0-flash",
+      "gemini-1.5-flash-latest",
+  ]
+  for m in models_to_try:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": f"التعليمات: {SYSTEM_PROMPT}\n\nرسالة المتصل:"
+                 f" {user_message}"}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.85, "maxOutputTokens": 150},
+    }
+    try:
+      async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, timeout=8) as resp:
+          if resp.status == 200:
+            data = await resp.json()
+            parts = (
+                data.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [])
+            )
+            if parts and "text" in parts[0]:
+              text = parts[0]["text"].strip()
+              logger.info(f"✅ تم توليد الرد بنجاح عبر Gemini ({m})")
+              return text
+          else:
+            err = await resp.text()
+            logger.error(f"خطأ Gemini ({m} - {resp.status}): {err}")
+    except Exception as e:
+      logger.error(f"استثناء Gemini ({m}): {e}")
+  return ""
+
+
+async def query_openrouter_direct(user_message: str) -> str:
+  """الاتصال الاحتياطي بخوادم OpenRouter"""
+  if not OPENROUTER_API_KEY:
+    return ""
+
+  url = "https://openrouter.ai/api/v1/chat/completions"
+  headers = {
+      "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+      "HTTP-Referer": "https://render.com",
+      "X-Title": "Telegram Iraqi AI Bot",
+      "Content-Type": "application/json",
+  }
+  models = [
+      "meta-llama/llama-3.3-70b-instruct:free",
+      "google/gemini-2.0-flash-exp:free",
+  ]
+  for m in models:
+    payload = {
+        "model": m,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        "max_tokens": 150,
+        "temperature": 0.8,
+    }
+    try:
+      async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url, headers=headers, json=payload, timeout=8
+        ) as resp:
+          if resp.status == 200:
+            data = await resp.json()
+            text = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            if text:
+              logger.info(f"✅ تم توليد الرد بنجاح عبر OpenRouter ({m})")
+              return text
+    except Exception as e:
+      logger.error(f"استثناء OpenRouter: {e}")
+  return ""
+
 
 async def generate_ai_reply(user_message: str) -> str:
-  """توليد الرد الذكي العراقي مباشرة عبر Google Gemini"""
-  fallback_text = (
-      "هلا بيك عيوني، صاحب الحساب ما متواجد حالياً، انتظر رده وأول ما يفرغ"
-      " يتواصل وياك إن شاء الله 🥰"
-  )
+  """توليد الرد الذكي العراقي الواقعي"""
+  # 1. المحاولة أولاً عبر Google Gemini المباشر
+  reply = await query_gemini_direct(user_message)
+  if reply:
+    return reply
 
-  if not model or not user_message:
-    return fallback_text
+  # 2. المحاولة ثانياً عبر OpenRouter إذا كان متاحاً
+  reply = await query_openrouter_direct(user_message)
+  if reply:
+    return reply
 
-  try:
-    loop = asyncio.get_running_loop()
-    response = await loop.run_in_executor(
-        None, model.generate_content, user_message
-    )
-    if response and response.text:
-      logger.info("✅ تم توليد الرد بنجاح عبر Google Gemini.")
-      return response.text.strip()
-  except Exception as e:
-    logger.error(f"خطأ أثناء استدعاء Google Gemini: {e}")
-
-  return fallback_text
+  # 3. رد احتياطي عراقي عفوي متنوع
+  return random.choice(FALLBACK_VARIATIONS)
 
 
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
@@ -99,23 +168,19 @@ async def handle_business_message(message: types.Message):
   text = message.text or message.caption or ""
 
   try:
-    # 1. إذا كانت الرسالة صادرة منك أنت (أنت نشط حالياً):
+    # 1. إذا كنت أنت من يكتب في المحادثة (أنت نشط حالياً):
     if message.chat.type == "private" and message.from_user.id != message.chat.id:
       LAST_OWNER_ACTIVITY = current_time
       if chat_id in USER_CONVERSATIONS:
         del USER_CONVERSATIONS[chat_id]
-      logger.info(
-          f"أنت نشط الآن. تم تحديث وقت النشاط وتصفير عداد المحادثة لـ: {chat_id}"
-      )
+      logger.info(f"أنت نشط الآن. تم تصفير المحادثة لـ: {chat_id}")
       return
 
-    # 2. التحقق من خمولك لمدة 1 دقيقة (60 ثانية):
+    # 2. التحقق من خمولك لمدة دقيقة (60 ثانية):
     time_since_owner_active = current_time - LAST_OWNER_ACTIVITY
     if time_since_owner_active < OWNER_INACTIVITY_THRESHOLD:
       secs_left = int(OWNER_INACTIVITY_THRESHOLD - time_since_owner_active)
-      logger.info(
-          f"أنت نشط حالياً (متبقي {secs_left} ثانية لتفعيل الرد الذكي)."
-      )
+      logger.info(f"أنت نشط حالياً (متبقي {secs_left} ثانية لتفعيل الرد).")
       return
 
     # 3. التحقق من حد الـ 10 رسائل لكل مستخدم:
@@ -132,7 +197,7 @@ async def handle_business_message(message: types.Message):
       )
       return
 
-    # 4. توليد الرد الذكي المخصص لكل رسالة عبر Google Gemini:
+    # 4. توليد الرد العراقي الواقعي بالذكاء الاصطناعي:
     conv["count"] += 1
     conv["last_msg_time"] = current_time
 
@@ -151,15 +216,15 @@ async def handle_business_message(message: types.Message):
 @dp.message(CommandStart())
 async def handle_start(message: types.Message):
   await message.answer(
-      "أهلاً بك! البوت مبرمج بـ Google Gemini الرسمي للردود التلقائية الذكية"
-      " باللهجة العراقية."
+      "أهلاً بك! البوت مبرمج بالذكاء الاصطناعي للردود التلقائية الواقعية باللهجة"
+      " العراقية."
   )
 
 
 # خادم ويب لإبقاء Render نشطاً
 async def health_check(request):
   return web.Response(
-      text="Telegram Business Gemini AI Bot is running!", status=200
+      text="Telegram Business Iraqi AI Bot is running smoothly!", status=200
   )
 
 
@@ -186,7 +251,7 @@ async def main():
 
   await start_web_server()
   await bot.delete_webhook(drop_pending_updates=True)
-  logger.info("بدء الاستماع للرسائل بالذكاء الاصطناعي من Google Gemini...")
+  logger.info("بدء الاستماع للرسائل بالذكاء الاصطناعي الواقعي...")
   await dp.start_polling(bot)
 
 
